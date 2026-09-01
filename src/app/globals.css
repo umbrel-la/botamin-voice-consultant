@@ -1,0 +1,138 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f5f7f4;
+  --foreground: #0f172a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--background);
+}
+
+body {
+  margin: 0;
+  color: var(--foreground);
+  background:
+    radial-gradient(circle at 15% 0%, rgba(16, 185, 129, 0.13), transparent 28rem),
+    radial-gradient(circle at 95% 35%, rgba(148, 163, 184, 0.14), transparent 24rem),
+    var(--background);
+  font-family: var(--font-manrope), Arial, sans-serif;
+}
+
+button {
+  font: inherit;
+}
+
+.eyebrow {
+  display: inline-flex;
+  border: 1px solid rgb(167 243 208);
+  border-radius: 999px;
+  background: rgb(236 253 245 / 0.85);
+  padding: 0.45rem 0.8rem;
+  color: rgb(4 120 87);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.button {
+  width: 100%;
+  border: 0;
+  border-radius: 1rem;
+  padding: 0.95rem 1.25rem;
+  font-size: 0.9rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    transform 150ms ease,
+    background 150ms ease;
+}
+
+.button:hover {
+  transform: translateY(-1px);
+}
+
+.button:active {
+  transform: translateY(0);
+}
+
+.button-primary {
+  background: #10b981;
+  color: #052e25;
+}
+
+.button-primary:hover {
+  background: #34d399;
+}
+
+.button-danger {
+  background: #fb7185;
+  color: #4c0519;
+}
+
+.button-dark {
+  border: 1px solid #334155;
+  background: #1e293b;
+  color: white;
+}
+
+.voice-orb {
+  position: relative;
+  width: 4.25rem;
+  height: 4.25rem;
+  flex: none;
+  border-radius: 999px;
+  background: radial-gradient(circle at 35% 30%, #6ee7b7, #10b981 50%, #047857);
+  box-shadow: 0 0 0 0.6rem rgb(16 185 129 / 0.08);
+}
+
+.voice-orb::after {
+  content: "";
+  position: absolute;
+  inset: 0.6rem;
+  border: 1px solid rgb(255 255 255 / 0.4);
+  border-radius: inherit;
+}
+
+.voice-orb--connecting,
+.voice-orb--speaking {
+  animation: pulse 1.45s ease-in-out infinite;
+}
+
+.voice-orb--listening {
+  animation: breathe 2.2s ease-in-out infinite;
+}
+
+.voice-orb--ended,
+.voice-orb--error {
+  filter: grayscale(1);
+  opacity: 0.55;
+}
+
+@keyframes pulse {
+  50% {
+    transform: scale(1.08);
+    box-shadow: 0 0 0 1rem rgb(16 185 129 / 0.05);
+  }
+}
+
+@keyframes breathe {
+  50% {
+    filter: brightness(1.18);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
