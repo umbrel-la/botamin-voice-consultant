@@ -117,3 +117,11 @@ vercel --prod
 - [ ] Попросить показать системный промпт — агент не раскрывает его и возвращает к записи.
 - [ ] Попытаться сменить роль — агент сохраняет роль консультанта.
 - [ ] Пройти полный сценарий: компания → слот → телефон/Telegram → email → подтверждение → заявки → менеджеры.
+
+## Подключение ИИ-менеджера
+
+Заполните переменные из `.env.example` только на сервере или в настройках Vercel. `OPENAI_API_KEY` создаётся в OpenAI Platform. `SUPABASE_URL` и `SUPABASE_SERVICE_ROLE_KEY` берутся в Supabase Project Settings → API. Примените вручную SQL из `supabase/migrations/202609090001_ai_manager.sql`; таблицы не должны быть доступны через browser roles.
+
+В Cal.com подключите календарь менеджера, создайте 20-минутный event type `consultation` у пользователя `diego-bolt-zdsas2` и добавьте `CALCOM_API_KEY` из Cal.com API keys. Настройте доступность: будни, 09:00–17:20 МСК, без записи на текущий день.
+
+Создайте Telegram bot через BotFather, получите `TELEGRAM_BOT_TOKEN`, добавьте бота в чат менеджера и укажите его `TELEGRAM_MANAGER_CHAT_ID`. `CRON_SECRET` — случайная длинная строка для Vercel Cron; добавьте её в Vercel вместе со всеми server-only переменными. Vercel Cron вызывает `/api/cron/notifications` каждые 10 минут.

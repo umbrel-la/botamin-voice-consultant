@@ -2,19 +2,11 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  confirmBooking,
   createInitialSessionState,
-  getAvailableSlots,
   maskSensitiveText,
-  saveCompanyActivity,
-  saveContact,
-  saveQualification,
-  saveWorkEmail,
-  selectSlot,
-  type ContactType,
   type SessionState,
-  type ToolResult,
 } from "@/lib/business";
+import type { PublicLead, Slot, ToolResult } from "@/lib/lead-types";
 
 type CallStatus =
   | "idle"
@@ -56,17 +48,6 @@ const statusLabels: Record<CallStatus, string> = {
   error: "Ошибка",
 };
 
-function maskContact(type: ContactType, value: string) {
-  if (type === "telegram") return `${value.slice(0, 2)}***`;
-  const digits = value.replace(/\D/g, "");
-  return `+* (***) ***-**-${digits.slice(-2)}`;
-}
-
-function maskEmail(email: string) {
-  const [name, domain] = email.split("@");
-  return `${name.slice(0, 2)}***@${domain}`;
-}
-
 export default function VoiceConsultant() {
   const [status, setStatus] = useState<CallStatus>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -74,6 +55,9 @@ export default function VoiceConsultant() {
   const [session, setSession] = useState<SessionState>(
     createInitialSessionState,
   );
+  const [lead, setLead] = useState<PublicLead | null>(null);
+  const [slots, setSlots] = useState<Slot[]>([]);
+  const [bookingBusy, setBookingBusy] = useState(false);
 
   const sessionRef = useRef(session);
   const peerRef = useRef<RTCPeerConnection | null>(null);
@@ -106,62 +90,23 @@ export default function VoiceConsultant() {
     }
   }, []);
 
-  const runTool = useCallback(
-    (name: string, args: Record<string, unknown>): ToolResult => {
-      const state = sessionRef.current;
-      let result: [SessionState, ToolResult];
-
-      switch (name) {
-        case "save_company_activity":
-          result = saveCompanyActivity(state, String(args.activity ?? ""));
-          break;
-        case "get_available_slots":
-          result = getAvailableSlots(state);
-          break;
-        case "select_slot":
-          result = selectSlot(state, String(args.slotId ?? ""));
-          break;
-        case "save_contact":
-          result = saveContact(
-            state,
-            args.type as ContactType,
-            String(args.value ?? ""),
-          );
-          break;
-        case "save_work_email":
-          result = saveWorkEmail(state, String(args.email ?? ""));
-          break;
-        case "confirm_booking":
-          result = confirmBooking(state);
-          break;
-        case "save_qualification":
-          result = saveQualification(
-            state,
-            String(args.leadsPerMonth ?? ""),
-            String(args.salesManagersCount ?? ""),
-          );
-          break;
-        default:
-          return { success: false, message: `Неизвестный tool: ${name}` };
-      }
-
-      updateSession(result[0]);
-      if (name === "save_contact" || name === "save_work_email") {
-        setTranscript((lines) =>
-          lines.map((line) =>
-            line.role === "user"
-              ? { ...line, text: maskSensitiveText(line.text) }
-              : line,
-          ),
-        );
-      }
-      return result[1];
-    },
-    [updateSession],
-  );
+  const runTool = useCallback(async (name: string, args: Record<string, unknown>, callId?: string): Promise<ToolResult> => {
+    const response = await fetch("/api/lead/tool", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tool: name, args, callId }),
+    });
+    const result = (await response.json()) as ToolResult;
+    if (result.lead) setLead(result.lead);
+    if (result.slots) setSlots(result.slots);
+    if (name === "save_contact" || name === "save_work_email") {
+      setTranscript((lines) => lines.map((line) => line.role === "user" ? { ...line, text: maskSensitiveText(line.text) } : line));
+    }
+    return result;
+  }, []);
 
   const handleFunctionCall = useCallback(
-    (name?: string, callId?: string, rawArguments?: string) => {
+    async (name?: string, callId?: string, rawArguments?: string) => {
       if (!name || !callId || handledCallsRef.current.has(callId)) return;
       handledCallsRef.current.add(callId);
 
@@ -171,7 +116,7 @@ export default function VoiceConsultant() {
       } catch {
         args = {};
       }
-      const result = runTool(name, args);
+      const result = await runTool(name, args, callId);
       sendEvent({
         type: "conversation.item.create",
         item: {
@@ -244,6 +189,8 @@ export default function VoiceConsultant() {
     handledCallsRef.current.clear();
     setError(null);
     setTranscript([]);
+    setLead(null);
+    setSlots([]);
     updateSession(createInitialSessionState());
     setStatus("connecting");
 
@@ -257,16 +204,18 @@ export default function VoiceConsultant() {
       });
       streamRef.current = media;
 
-      const tokenResponse = await fetch("/api/realtime-token", {
+      const tokenResponse = await fetch("/api/voice-session", {
         method: "POST",
       });
       const tokenData = (await tokenResponse.json()) as {
         value?: string;
         error?: string;
+        lead?: PublicLead;
       };
       if (!tokenResponse.ok || !tokenData.value) {
         throw new Error(tokenData.error || "Не удалось получить временный ключ.");
       }
+      setLead(tokenData.lead ?? null);
 
       const peer = new RTCPeerConnection();
       peerRef.current = peer;
@@ -352,141 +301,137 @@ export default function VoiceConsultant() {
     handledCallsRef.current.clear();
     updateSession(createInitialSessionState());
     setTranscript([]);
+    setLead(null);
+    setSlots([]);
     setError(null);
     setStatus("idle");
   };
 
   const progress = useMemo(
     () => [
-      { label: "Компания", done: Boolean(session.companyActivity) },
-      { label: "Слот", done: Boolean(session.selectedSlot) },
+      { label: "Компания", done: Boolean(lead?.companyActivity) },
+      { label: "Слот", done: Boolean(lead?.selectedSlot) },
       {
         label: "Контакты",
-        done: Boolean(session.contact && session.workEmail),
+        done: Boolean(lead?.name && (lead.phone || lead.telegram) && lead.workEmail),
       },
-      { label: "Встреча", done: session.bookingConfirmed },
-      { label: "Квалификация", done: Boolean(session.qualification) },
+      { label: "Встреча", done: lead?.bookingStatus === "confirmed" },
+      { label: "Квалификация", done: Boolean(lead?.leadsPerMonth && lead.salesManagersCount) },
     ],
-    [session],
+    [lead],
   );
 
   const active = ["connecting", "listening", "speaking"].includes(status);
+  const requestTool = async (tool: string, args: Record<string, unknown>) => {
+    try {
+      const result = await runTool(tool, args, crypto.randomUUID());
+      if (!result.success) setError(result.message);
+      return result;
+    } catch {
+      setError("Сервис временно недоступен. Попробуйте ещё раз.");
+      return null;
+    }
+  };
+
+  const confirmBooking = async () => {
+    setBookingBusy(true);
+    const result = await requestTool("confirm_booking", { consent: true });
+    setBookingBusy(false);
+    if (!result?.success) return;
+  };
 
   return (
-    <main className="min-h-screen px-4 py-8 sm:px-6 sm:py-14">
-      <div className="mx-auto max-w-5xl">
-        <header className="mb-8">
-          <span className="eyebrow">AI voice agent · Москва</span>
-          <h1 className="mt-4 text-4xl font-semibold tracking-tight text-slate-950 sm:text-6xl">
-            Botamin Voice
-            <span className="block text-emerald-600">Consultant</span>
-          </h1>
-          <p className="mt-5 max-w-2xl text-base leading-7 text-slate-600 sm:text-lg">
-            Голосовой консультант для первичной квалификации и записи на встречу
-          </p>
+    <main className="voxaura-page">
+      <div className="aurora aurora--one" aria-hidden />
+      <div className="aurora aurora--two" aria-hidden />
+      <div className="voxaura-shell">
+        <header className="voxaura-header">
+          <a href="#" className="voxaura-brand" aria-label="Botamin">
+            <span className="brand-glyph" aria-hidden>◌</span>
+            Botamin<span className="brand-cursor">°</span>
+          </a>
+          <div className="system-status">
+            <span aria-hidden className="status-led" />
+            Консультант онлайн
+          </div>
         </header>
 
-        <section className="mb-5 rounded-3xl border border-white/80 bg-white/75 p-4 shadow-sm backdrop-blur sm:p-5">
-          <div className="grid grid-cols-5 gap-2">
-            {progress.map((step, index) => (
-              <div key={step.label} className="min-w-0">
-                <div
-                  className={`mb-2 h-1.5 rounded-full ${step.done ? "bg-emerald-500" : "bg-slate-200"}`}
-                />
-                <p
-                  className={`truncate text-[10px] font-medium sm:text-xs ${step.done ? "text-emerald-700" : "text-slate-400"}`}
-                >
-                  {index + 1}. {step.label}
-                </p>
-              </div>
-            ))}
-          </div>
-        </section>
+        <div className="voxaura-grid">
+          <section className="hero-terminal">
+            <p className="terminal-kicker">BOTAMIN · VOICE INTELLIGENCE</p>
+            <h1>
+              Говорите
+              <span>свободно.</span>
+            </h1>
+            <p className="terminal-copy">
+              Голосовой консультант поможет понять вашу задачу и подберёт
+              время для короткого разговора с экспертом.
+            </p>
 
-        <div className="grid gap-5 lg:grid-cols-[0.9fr_1.1fr]">
-          <section className="rounded-3xl bg-slate-950 p-6 text-white shadow-xl shadow-slate-900/10 sm:p-8">
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
-                  Статус
-                </p>
-                <p className="mt-2 text-xl font-medium">
-                  {statusLabels[status]}
-                </p>
-              </div>
-              <div className={`voice-orb voice-orb--${status}`} aria-hidden />
+            <div className={`nexus-orb nexus-orb--${status}`} aria-hidden>
+              <span className="orb-frame orb-frame--one" />
+              <span className="orb-frame orb-frame--two" />
+              <span className="orb-core">
+                <i />
+                <i />
+                <i />
+                <i />
+                <i />
+              </span>
             </div>
 
-            <p className="mt-12 text-sm leading-6 text-slate-400">
-              Разрешите доступ к микрофону. Агент говорит по-русски, предложит
-              два слота и попросит контакты для подтверждения.
+            <p className="voice-status" aria-live="polite">
+              <span>{status === "speaking" ? "ГОВОРИТ" : "ГОТОВ"}</span>
+              {statusLabels[status]}
             </p>
 
             {error && (
-              <div
-                role="alert"
-                className="mt-5 rounded-2xl border border-rose-400/20 bg-rose-400/10 p-4 text-sm leading-6 text-rose-100"
-              >
-                {error}
+              <div className="nexus-error" role="alert">
+                <strong>Не удалось подключиться</strong>
+                <p>{error}</p>
               </div>
             )}
 
-            <div className="mt-6 flex flex-col gap-3">
+            <div className="nexus-controls">
               {!active && status !== "ended" && (
-                <button
-                  onClick={startConversation}
-                  className="button button-primary"
-                >
-                  Начать разговор
+                <button onClick={startConversation} className="nexus-button">
+                  <span>◉</span> Начать разговор
                 </button>
               )}
               {active && (
-                <button
-                  onClick={endConversation}
-                  className="button button-danger"
-                >
-                  Завершить разговор
+                <button onClick={endConversation} className="nexus-button nexus-button--stop">
+                  <span>■</span> Завершить разговор
                 </button>
               )}
               {(status === "ended" || status === "error") && (
-                <button onClick={resetConversation} className="button button-dark">
-                  Начать заново
+                <button onClick={resetConversation} className="nexus-button">
+                  <span>↻</span> Начать заново
                 </button>
               )}
+              <small>Доступ к микрофону запрашивается только после нажатия кнопки</small>
             </div>
           </section>
 
-          <section className="flex min-h-[430px] flex-col rounded-3xl border border-slate-200/80 bg-white p-5 shadow-sm sm:p-7">
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-slate-900">
-                Расшифровка
-              </h2>
-              <span className="rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-500">
-                Контакты маскируются
-              </span>
+          <section className="nexus-panel transcript-panel">
+            <div className="panel-header">
+              <span>В РЕАЛЬНОМ ВРЕМЕНИ</span>
+              <span className="panel-chip">КОНТАКТЫ СКРЫТЫ</span>
             </div>
-            <div
-              className="mt-5 flex max-h-[480px] flex-1 flex-col gap-3 overflow-y-auto pr-1"
-              aria-live="polite"
-            >
+            <h2>Диалог</h2>
+            <div className="transcript-stream" aria-live="polite">
               {transcript.length === 0 ? (
-                <div className="m-auto max-w-xs text-center text-sm leading-6 text-slate-400">
-                  Здесь появятся реплики консультанта и ваши ответы.
+                <div className="terminal-empty">
+                  <span>ОЖИДАНИЕ СЕАНСА</span>
+                  <p>Здесь появятся реплики консультанта и ваши ответы.</p>
                 </div>
               ) : (
                 transcript.map((line) => (
                   <div
                     key={line.id}
-                    className={`max-w-[88%] rounded-2xl px-4 py-3 text-sm leading-6 ${
-                      line.role === "assistant"
-                        ? "self-start rounded-bl-md bg-slate-100 text-slate-700"
-                        : "self-end rounded-br-md bg-emerald-600 text-white"
-                    }`}
+                    className={`terminal-message terminal-message--${line.role}`}
                   >
-                    <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wider opacity-60">
-                      {line.role === "assistant" ? "Botamin" : "Вы"}
-                    </span>
-                    {line.text}
+                    <span>{line.role === "assistant" ? "BOTAMIN" : "ВЫ"}</span>
+                    <p>{line.text}</p>
                   </div>
                 ))
               )}
@@ -494,40 +439,72 @@ export default function VoiceConsultant() {
           </section>
         </div>
 
-        {session.bookingConfirmed &&
-          session.selectedSlot &&
-          session.contact &&
-          session.workEmail && (
-            <section className="mt-5 rounded-3xl border border-emerald-200 bg-emerald-50 p-6 sm:p-8">
-              <div className="flex flex-col justify-between gap-5 sm:flex-row sm:items-center">
-                <div>
-                  <span className="inline-flex rounded-full bg-emerald-600 px-3 py-1 text-xs font-semibold text-white">
-                    Встреча подтверждена
-                  </span>
-                  <h2 className="mt-4 text-2xl font-semibold text-slate-950">
-                    {session.selectedSlot.label}
-                  </h2>
-                  <p className="mt-2 text-sm text-slate-600">
-                    20 минут · время московское
-                  </p>
+        {lead && (
+          <section className="nexus-panel manager-panel">
+            <div className="panel-header"><span>ЗАПИСЬ НА КОНСУЛЬТАЦИЮ</span><span>{lead.bookingStatus}</span></div>
+            <div className="manager-grid">
+              <div>
+                <h2>Свободное время</h2>
+                <div className="slot-list">
+                  {slots.length === 0 ? (
+                    <button className="slot-button" onClick={() => void requestTool("get_available_slots", {})}>Показать свободные слоты</button>
+                  ) : slots.map((slot) => (
+                    <button key={slot.id} className={`slot-button ${lead.selectedSlot?.id === slot.id ? "is-selected" : ""}`} onClick={() => void requestTool("select_slot", { slot })}>
+                      {slot.label} · МСК
+                    </button>
+                  ))}
+                  <button className="text-action" onClick={() => void requestTool("get_available_slots", {})}>Другие варианты</button>
                 </div>
-                <div className="rounded-2xl bg-white/80 p-4 text-sm leading-7 text-slate-600">
+              </div>
+              <div>
+                <h2>Контакты</h2>
+                <div className="contact-form">
+                  <input aria-label="Имя" placeholder="Имя" defaultValue={lead.name ?? ""} onBlur={(event) => void requestTool("save_name", { name: event.currentTarget.value })} />
+                  <input aria-label="Телефон или Telegram" placeholder="Телефон или @telegram" defaultValue={lead.phone ?? lead.telegram ?? ""} onBlur={(event) => { const value = event.currentTarget.value; void requestTool("save_contact", { type: value.trim().startsWith("@") ? "telegram" : "phone", value }); }} />
+                  <input aria-label="Рабочая почта" placeholder="Рабочая почта" type="email" defaultValue={lead.workEmail ?? ""} onBlur={(event) => void requestTool("save_work_email", { email: event.currentTarget.value })} />
+                </div>
+              </div>
+            </div>
+            {lead.selectedSlot && (
+              <div className="review-card">
+                <div><span>ПРОВЕРЬТЕ ДАННЫЕ</span><p>{lead.name ?? "Имя не указано"} · {lead.selectedSlot.label} МСК</p><small>Нажимая «Записаться», вы соглашаетесь передать контакты и запрос менеджеру Botamin для организации встречи.</small></div>
+                <button className="nexus-button" disabled={bookingBusy} onClick={() => void confirmBooking()}>{bookingBusy ? "Создаём запись…" : "Записаться"}</button>
+              </div>
+            )}
+          </section>
+        )}
+
+        <section className="nexus-panel nexus-progress">
+          <div className="panel-header">
+            <span>ПРОГРЕСС ВСТРЕЧИ</span>
+            <span>{progress.filter((step) => step.done).length}/5</span>
+          </div>
+          <div className="progress-steps">
+            {progress.map((step, index) => (
+              <div key={step.label} className={`mission-step ${step.done ? "is-complete" : ""}`}>
+                <span>{step.done ? "✓" : String(index + 1).padStart(2, "0")}</span>
+                <p>{step.label}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {lead?.bookingStatus === "confirmed" && lead.selectedSlot && (
+            <section className="nexus-panel booking-panel">
+              <div className="booking-sigil" aria-hidden>✓</div>
+              <div>
+                <p className="panel-header">ВСТРЕЧА ПОДТВЕРЖДЕНА</p>
+                <h2>{lead.selectedSlot.label}</h2>
+                <p className="booking-subtitle">20 минут · время московское</p>
+              </div>
+              <div className="booking-contacts">
                   <div>
-                    {session.contact.type === "phone" ? "Телефон" : "Telegram"}:{" "}
-                    <strong className="text-slate-900">
-                      {maskContact(
-                        session.contact.type,
-                        session.contact.value,
-                      )}
-                    </strong>
+                    Контакт: <strong>{lead.phone ?? lead.telegram ?? "не указан"}</strong>
                   </div>
                   <div>
-                    Почта:{" "}
-                    <strong className="text-slate-900">
-                      {maskEmail(session.workEmail)}
-                    </strong>
+                    Почта: <strong>{lead.workEmail ?? "не указана"}</strong>
                   </div>
-                </div>
+                  {lead.meetingUrl && <div>Ссылка: <a href={lead.meetingUrl} target="_blank" rel="noreferrer">Открыть встречу</a></div>}
               </div>
             </section>
           )}
