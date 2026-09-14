@@ -132,4 +132,4 @@ vercel --prod
 
 В Cal.com подключите календарь менеджера, создайте 20-минутный event type `consultation` у пользователя `diego-bolt-zdsas2` и добавьте `CALCOM_API_KEY` из Cal.com API keys. Настройте доступность: будни, 09:00–17:20 МСК, без записи на текущий день.
 
-Создайте Telegram bot через BotFather, получите `TELEGRAM_BOT_TOKEN`, добавьте бота в чат менеджера и укажите его `TELEGRAM_MANAGER_CHAT_ID`. `CRON_SECRET` — случайная длинная строка для Vercel Cron; добавьте её в Vercel вместе со всеми server-only переменными. Vercel Cron вызывает `/api/cron/notifications` каждые 10 минут.
+Создайте Telegram bot через BotFather, получите `TELEGRAM_BOT_TOKEN`, добавьте бота в чат менеджера и укажите его `TELEGRAM_MANAGER_CHAT_ID`. `CRON_SECRET` — случайная длинная строка для Vercel Cron; добавьте её в Vercel вместе со всеми server-only переменными. На Hobby-плане Vercel Cron вызывает `/api/cron/notifications` один раз в сутки; повторная доставка Telegram также выполняется сразу после успешной брони.
