@@ -1,21 +1,21 @@
 import { NextResponse } from "next/server";
 import { REALTIME_TOOLS, REALTIME_VOICE, SYSTEM_PROMPT } from "@/lib/agent-config";
 import { createLead, getLead, toPublicLead } from "@/lib/lead-store";
-import { insertLead } from "@/lib/supabase-repository";
+import { parseLeadCookie } from "@/lib/session-secret";
+import { STORE_RETRY_MESSAGE, StoreUnavailableError } from "@/lib/store-errors";
 import { buildRealtimeResumeInstructions } from "@/lib/resume-context";
 
 export const runtime = "nodejs";
 
-function readLeadSession(request: Request) {
-  const cookie = request.headers.get("cookie")
+async function readLeadSession(request: Request) {
+  const header = request.headers.get("cookie")
     ?.split(";")
     .map((value) => value.trim())
     .find((value) => value.startsWith("botamin_lead="))
     ?.slice("botamin_lead=".length);
-  if (!cookie) return null;
-  const separator = cookie.indexOf(".");
-  if (separator < 1) return null;
-  return getLead(cookie.slice(0, separator), cookie.slice(separator + 1));
+  const session = parseLeadCookie(header);
+  if (!session) return null;
+  return getLead(session.leadId, session.secret);
 }
 
 export async function POST(request: Request) {
@@ -23,11 +23,8 @@ export async function POST(request: Request) {
   if (!apiKey) return NextResponse.json({ error: "Голосовой сервис не настроен." }, { status: 503 });
 
   try {
-    const resumedLead = readLeadSession(request);
-    const lead = resumedLead ?? createLead();
-    if (!resumedLead && !(await insertLead(lead)) && process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
-      return NextResponse.json({ error: "Хранилище заявок временно недоступно." }, { status: 503 });
-    }
+    const resumedLead = await readLeadSession(request);
+    const lead = resumedLead ?? await createLead();
     const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
       method: "POST",
       headers: {
@@ -65,7 +62,10 @@ export async function POST(request: Request) {
       httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production", path: "/", maxAge: 60 * 60,
     });
     return result;
-  } catch {
+  } catch (error) {
+    if (error instanceof StoreUnavailableError) {
+      return NextResponse.json({ error: STORE_RETRY_MESSAGE }, { status: 503 });
+    }
     return NextResponse.json({ error: "Не удалось связаться с голосовым сервисом." }, { status: 502 });
   }
 }
