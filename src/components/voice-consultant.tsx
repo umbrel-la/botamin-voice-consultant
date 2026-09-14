@@ -11,6 +11,7 @@ import type { PublicLead, Slot, ToolResult } from "@/lib/lead-types";
 type CallStatus =
   | "idle"
   | "connecting"
+  | "reconnecting"
   | "listening"
   | "speaking"
   | "ended"
@@ -25,10 +26,13 @@ type TranscriptLine = {
 type RealtimeEvent = {
   type: string;
   transcript?: string;
+  delta?: string;
   name?: string;
   call_id?: string;
   arguments?: string;
   response?: {
+    id?: string;
+    status?: string;
     output?: Array<{
       type?: string;
       name?: string;
@@ -42,6 +46,7 @@ type RealtimeEvent = {
 const statusLabels: Record<CallStatus, string> = {
   idle: "Готовы начать",
   connecting: "Подключаемся",
+  reconnecting: "Переподключаемся, диалог сохранён…",
   listening: "Слушаю",
   speaking: "Агент отвечает",
   ended: "Разговор завершён",
@@ -58,6 +63,9 @@ export default function VoiceConsultant() {
   const [lead, setLead] = useState<PublicLead | null>(null);
   const [slots, setSlots] = useState<Slot[]>([]);
   const [bookingBusy, setBookingBusy] = useState(false);
+  const [bookingReviewVisible, setBookingReviewVisible] = useState(false);
+  const [meetingUrlCopied, setMeetingUrlCopied] = useState(false);
+  const [bookingModalVisible, setBookingModalVisible] = useState(false);
 
   const sessionRef = useRef(session);
   const peerRef = useRef<RTCPeerConnection | null>(null);
@@ -65,6 +73,15 @@ export default function VoiceConsultant() {
   const streamRef = useRef<MediaStream | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const handledCallsRef = useRef(new Set<string>());
+  const activeResponseIdRef = useRef<string | null>(null);
+  const responseRequestedRef = useRef(false);
+  const startingRef = useRef(false);
+  const bookingBusyRef = useRef(false);
+  const activeAssistantBubbleRef = useRef<{ id: string; responseId: string | null } | null>(null);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const manuallyEndedRef = useRef(false);
+  const reconnectRef = useRef<() => void>(() => undefined);
 
   const updateSession = useCallback((next: SessionState) => {
     sessionRef.current = next;
@@ -83,12 +100,46 @@ export default function VoiceConsultant() {
     [],
   );
 
+  const appendAssistantDelta = useCallback((delta: string, responseId: string | null) => {
+    const safe = maskSensitiveText(delta);
+    if (!safe) return;
+    const activeBubble = activeAssistantBubbleRef.current;
+    if (activeBubble && activeBubble.responseId === responseId) {
+      setTranscript((current) =>
+        current.map((line) =>
+          line.id === activeBubble.id ? { ...line, text: `${line.text}${safe}` } : line,
+        ),
+      );
+      return;
+    }
+    const id = crypto.randomUUID();
+    activeAssistantBubbleRef.current = { id, responseId };
+    setTranscript((current) => [...current, { id, role: "assistant", text: safe }]);
+  }, []);
+
+  const finalizeAssistantBubble = useCallback((responseId?: string) => {
+    if (!responseId || activeAssistantBubbleRef.current?.responseId === responseId) {
+      activeAssistantBubbleRef.current = null;
+    }
+  }, []);
+
   const sendEvent = useCallback((event: object) => {
     const channel = channelRef.current;
     if (channel?.readyState === "open") {
       channel.send(JSON.stringify(event));
     }
   }, []);
+
+  const requestResponse = useCallback((instructions?: string) => {
+    if (activeResponseIdRef.current || responseRequestedRef.current) return false;
+    responseRequestedRef.current = true;
+    sendEvent(
+      instructions
+        ? { type: "response.create", response: { instructions } }
+        : { type: "response.create" },
+    );
+    return true;
+  }, [sendEvent]);
 
   const runTool = useCallback(async (name: string, args: Record<string, unknown>, callId?: string): Promise<ToolResult> => {
     const response = await fetch("/api/lead/tool", {
@@ -107,7 +158,7 @@ export default function VoiceConsultant() {
 
   const handleFunctionCall = useCallback(
     async (name?: string, callId?: string, rawArguments?: string) => {
-      if (!name || !callId || handledCallsRef.current.has(callId)) return;
+      if (!name || !callId || handledCallsRef.current.has(callId)) return null;
       handledCallsRef.current.add(callId);
 
       let args: Record<string, unknown> = {};
@@ -125,83 +176,147 @@ export default function VoiceConsultant() {
           output: JSON.stringify(result),
         },
       });
-      sendEvent({ type: "response.create" });
+      return name;
     },
     [runTool, sendEvent],
   );
 
   const handleEvent = useCallback(
-    (event: RealtimeEvent) => {
+    async (event: RealtimeEvent) => {
       switch (event.type) {
         case "input_audio_buffer.speech_started":
           setStatus("listening");
+          if (activeResponseIdRef.current) {
+            sendEvent({ type: "response.cancel" });
+          }
           break;
         case "response.created":
+          activeResponseIdRef.current = event.response?.id ?? "pending";
+          responseRequestedRef.current = false;
+          setError((current) =>
+            current === "Ответ ещё формируется. Продолжаем разговор." ? null : current,
+          );
           setStatus("speaking");
           break;
         case "response.done": {
+          const responseId = event.response?.id;
+          activeResponseIdRef.current = null;
+          responseRequestedRef.current = false;
+          finalizeAssistantBubble(responseId);
           setStatus("listening");
-          event.response?.output
+          const calledTools = await Promise.all(
+            (event.response?.output ?? [])
             ?.filter((item) => item.type === "function_call")
-            .forEach((item) =>
+            .map((item) =>
               handleFunctionCall(
                 item.name,
                 item.call_id,
                 item.arguments,
               ),
+            ),
+          );
+          if (calledTools.some(Boolean)) {
+            const slotsWereReturned = calledTools.includes("get_available_slots");
+            requestResponse(
+              slotsWereReturned
+                ? "Коротко переспроси, какой из полученных слотов выбирает клиент. Не выбирай слот за него."
+                : undefined,
             );
+          }
           break;
         }
+        case "response.cancelled":
+        case "response.failed":
+          activeResponseIdRef.current = null;
+          responseRequestedRef.current = false;
+          finalizeAssistantBubble(event.response?.id);
+          setStatus("listening");
+          break;
         case "conversation.item.input_audio_transcription.completed":
-          if (event.transcript) appendTranscript("user", event.transcript);
+          if (event.transcript) {
+            appendTranscript("user", event.transcript);
+            void runTool(
+              "save_conversation_context",
+              { lastUserMessage: event.transcript },
+              crypto.randomUUID(),
+            );
+          }
+          break;
+        case "response.output_audio_transcript.delta":
+          if (event.delta) appendAssistantDelta(event.delta, activeResponseIdRef.current);
           break;
         case "response.output_audio_transcript.done":
-          if (event.transcript)
-            appendTranscript("assistant", event.transcript);
+          if (!activeAssistantBubbleRef.current && event.transcript) {
+            appendAssistantDelta(event.transcript, activeResponseIdRef.current);
+          }
           break;
-        case "response.function_call_arguments.done": {
-          handleFunctionCall(event.name, event.call_id, event.arguments);
-          break;
-        }
         case "error":
-          setError(event.error?.message || "Ошибка Realtime API.");
-          setStatus("error");
+          if ((event.error?.message || "").includes("active response")) {
+            setError("Ответ ещё формируется. Продолжаем разговор.");
+          } else {
+            setError(event.error?.message || "Ошибка Realtime API.");
+            setStatus("error");
+          }
           break;
       }
     },
-    [appendTranscript, handleFunctionCall],
+    [appendAssistantDelta, appendTranscript, finalizeAssistantBubble, handleFunctionCall, requestResponse, runTool, sendEvent],
   );
 
-  const cleanupConnection = useCallback(() => {
+  const closeTransport = useCallback(() => {
     channelRef.current?.close();
     peerRef.current?.close();
-    streamRef.current?.getTracks().forEach((track) => track.stop());
     if (audioRef.current) audioRef.current.srcObject = null;
     channelRef.current = null;
     peerRef.current = null;
-    streamRef.current = null;
   }, []);
 
-  useEffect(() => cleanupConnection, [cleanupConnection]);
+  const cleanupConnection = useCallback(() => {
+    closeTransport();
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+  }, [closeTransport]);
 
-  const startConversation = async () => {
+  useEffect(() => () => {
+    manuallyEndedRef.current = true;
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+    }
     cleanupConnection();
-    handledCallsRef.current.clear();
-    setError(null);
-    setTranscript([]);
-    setLead(null);
-    setSlots([]);
-    updateSession(createInitialSessionState());
-    setStatus("connecting");
+  }, [cleanupConnection]);
+
+  const startConversation = async (resume = false) => {
+    if (startingRef.current) return;
+    startingRef.current = true;
+    if (resume) closeTransport();
+    else cleanupConnection();
+    if (!resume) handledCallsRef.current.clear();
+    activeResponseIdRef.current = null;
+    responseRequestedRef.current = false;
+    activeAssistantBubbleRef.current = null;
+    if (!resume) {
+      manuallyEndedRef.current = false;
+      reconnectAttemptsRef.current = 0;
+      setError(null);
+      setTranscript([]);
+      setLead(null);
+      setSlots([]);
+      setBookingReviewVisible(false);
+      setMeetingUrlCopied(false);
+      updateSession(createInitialSessionState());
+    }
+    setStatus(resume ? "reconnecting" : "connecting");
 
     try {
-      const media = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
+      const media = streamRef.current?.active
+        ? streamRef.current
+        : await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
       streamRef.current = media;
 
       const tokenResponse = await fetch("/api/voice-session", {
@@ -211,6 +326,7 @@ export default function VoiceConsultant() {
         value?: string;
         error?: string;
         lead?: PublicLead;
+        resumed?: boolean;
       };
       if (!tokenResponse.ok || !tokenData.value) {
         throw new Error(tokenData.error || "Не удалось получить временный ключ.");
@@ -228,10 +344,17 @@ export default function VoiceConsultant() {
         audio.srcObject = event.streams[0];
         void audio.play().catch(() => undefined);
       };
+      const reconnectOnFailure = () => {
+        if (!manuallyEndedRef.current) reconnectRef.current();
+      };
       peer.onconnectionstatechange = () => {
         if (["failed", "disconnected"].includes(peer.connectionState)) {
-          setError("Соединение с голосовым агентом потеряно.");
-          setStatus("error");
+          reconnectOnFailure();
+        }
+      };
+      peer.oniceconnectionstatechange = () => {
+        if (["failed", "disconnected", "closed"].includes(peer.iceConnectionState)) {
+          reconnectOnFailure();
         }
       };
 
@@ -239,21 +362,20 @@ export default function VoiceConsultant() {
       channelRef.current = channel;
       channel.onmessage = (message) => {
         try {
-          handleEvent(JSON.parse(message.data) as RealtimeEvent);
+          void handleEvent(JSON.parse(message.data) as RealtimeEvent);
         } catch {
           setError("Получено некорректное событие Realtime API.");
         }
       };
       channel.onopen = () => {
-        setStatus("speaking");
-        sendEvent({
-          type: "response.create",
-          response: {
-            instructions:
-              "Поздоровайся сейчас дословно фразой из первого шага и задай только вопрос о деятельности компании.",
-          },
-        });
+        reconnectAttemptsRef.current = 0;
+        setError(null);
+        requestResponse(tokenData.resumed
+          ? "Продолжи диалог по переданному сервером контексту с единственного следующего логичного шага. Не здоровайся заново."
+          : "Поздоровайся сейчас дословно фразой из первого шага и задай только вопрос о деятельности компании.");
       };
+      channel.onclose = reconnectOnFailure;
+      channel.onerror = reconnectOnFailure;
 
       const offer = await peer.createOffer();
       await peer.setLocalDescription(offer);
@@ -276,33 +398,97 @@ export default function VoiceConsultant() {
         sdp: await sdpResponse.text(),
       });
     } catch (caught) {
-      cleanupConnection();
+      if (resume) closeTransport();
+      else cleanupConnection();
       const denied =
         caught instanceof DOMException &&
         ["NotAllowedError", "PermissionDeniedError"].includes(caught.name);
-      setError(
+      const message =
         denied
           ? "Доступ к микрофону запрещён. Разрешите его в настройках браузера и попробуйте снова."
           : caught instanceof Error
             ? caught.message
-            : "Не удалось подключиться к голосовому агенту.",
-      );
-      setStatus("error");
+            : "Не удалось подключиться к голосовому агенту.";
+      if (resume) {
+        setError("Не удалось переподключиться. Диалог сохранён.");
+        reconnectRef.current();
+      } else {
+        setError(message);
+        setStatus("error");
+      }
+    } finally {
+      startingRef.current = false;
     }
   };
 
+  useEffect(() => {
+    reconnectRef.current = () => {
+      if (manuallyEndedRef.current || !lead || !navigator.onLine) {
+        if (!manuallyEndedRef.current && lead) {
+          setStatus("reconnecting");
+          setError("Нет сети. Диалог сохранён — продолжим, когда соединение вернётся.");
+        }
+        return;
+      }
+      if (startingRef.current || reconnectTimerRef.current !== null) return;
+      const delays = [1000, 2000, 4000];
+      const attempt = reconnectAttemptsRef.current;
+      if (attempt >= delays.length) {
+        setStatus("error");
+        setError("Не удалось восстановить соединение. Диалог сохранён — попробуйте подключиться ещё раз.");
+        return;
+      }
+      reconnectAttemptsRef.current += 1;
+      setStatus("reconnecting");
+      setError(null);
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        void startConversation(true);
+      }, delays[attempt]);
+    };
+  });
+
+  useEffect(() => {
+    const onOnline = () => {
+      reconnectAttemptsRef.current = 0;
+      reconnectRef.current();
+    };
+    const onOffline = () => {
+      if (!manuallyEndedRef.current && lead) {
+        setStatus("reconnecting");
+        setError("Нет сети. Диалог сохранён — продолжим, когда соединение вернётся.");
+      }
+    };
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, [lead]);
+
   const endConversation = () => {
+    manuallyEndedRef.current = true;
+    if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
     cleanupConnection();
     setStatus("ended");
   };
 
   const resetConversation = () => {
+    manuallyEndedRef.current = true;
+    if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
     cleanupConnection();
     handledCallsRef.current.clear();
+    activeResponseIdRef.current = null;
+    responseRequestedRef.current = false;
     updateSession(createInitialSessionState());
     setTranscript([]);
     setLead(null);
     setSlots([]);
+    setBookingReviewVisible(false);
+    setMeetingUrlCopied(false);
     setError(null);
     setStatus("idle");
   };
@@ -321,7 +507,7 @@ export default function VoiceConsultant() {
     [lead],
   );
 
-  const active = ["connecting", "listening", "speaking"].includes(status);
+  const active = ["connecting", "reconnecting", "listening", "speaking"].includes(status);
   const requestTool = async (tool: string, args: Record<string, unknown>) => {
     try {
       const result = await runTool(tool, args, crypto.randomUUID());
@@ -334,11 +520,33 @@ export default function VoiceConsultant() {
   };
 
   const confirmBooking = async () => {
+    if (bookingBusyRef.current) return;
+    bookingBusyRef.current = true;
     setBookingBusy(true);
-    const result = await requestTool("confirm_booking", { consent: true });
-    setBookingBusy(false);
-    if (!result?.success) return;
+    try {
+      const result = await requestTool("confirm_booking", { consent: true });
+      if (result?.success && result.booking?.status === "confirmed") {
+        setBookingModalVisible(true);
+      }
+    } finally {
+      bookingBusyRef.current = false;
+      setBookingBusy(false);
+    }
   };
+
+  const copyMeetingUrl = async () => {
+    if (!lead?.meetingUrl) return;
+    try {
+      await navigator.clipboard.writeText(lead.meetingUrl);
+      setMeetingUrlCopied(true);
+    } catch {
+      setError("Не удалось скопировать ссылку. Вы можете открыть её в новой вкладке.");
+    }
+  };
+
+  const meetingLabel = lead?.meetingUrl?.includes("meet.google.com")
+    ? "Google Meet"
+    : "Ссылка на встречу";
 
   return (
     <main className="voxaura-page">
@@ -394,7 +602,7 @@ export default function VoiceConsultant() {
 
             <div className="nexus-controls">
               {!active && status !== "ended" && (
-                <button onClick={startConversation} className="nexus-button">
+                <button onClick={() => void startConversation()} className="nexus-button">
                   <span>◉</span> Начать разговор
                 </button>
               )}
@@ -404,9 +612,19 @@ export default function VoiceConsultant() {
                 </button>
               )}
               {(status === "ended" || status === "error") && (
-                <button onClick={resetConversation} className="nexus-button">
-                  <span>↻</span> Начать заново
-                </button>
+                <>
+                  {status === "error" && lead && (
+                    <button onClick={() => {
+                      reconnectAttemptsRef.current = 0;
+                      reconnectRef.current();
+                    }} className="nexus-button">
+                      <span>↻</span> Повторить подключение
+                    </button>
+                  )}
+                  <button onClick={resetConversation} className="nexus-button">
+                    <span>↻</span> Начать заново
+                  </button>
+                </>
               )}
               <small>Доступ к микрофону запрашивается только после нажатия кнопки</small>
             </div>
@@ -465,10 +683,34 @@ export default function VoiceConsultant() {
                 </div>
               </div>
             </div>
-            {lead.selectedSlot && (
+            {lead.selectedSlot && lead.bookingStatus !== "confirmed" && (
               <div className="review-card">
-                <div><span>ПРОВЕРЬТЕ ДАННЫЕ</span><p>{lead.name ?? "Имя не указано"} · {lead.selectedSlot.label} МСК</p><small>Нажимая «Записаться», вы соглашаетесь передать контакты и запрос менеджеру Botamin для организации встречи.</small></div>
-                <button className="nexus-button" disabled={bookingBusy} onClick={() => void confirmBooking()}>{bookingBusy ? "Создаём запись…" : "Записаться"}</button>
+                <div>
+                  <span>ПРОВЕРЬТЕ ДАННЫЕ</span>
+                  <p>{lead.name ?? "Имя не указано"} · {lead.selectedSlot.label} МСК</p>
+                  <dl className="review-details">
+                    <div><dt>Время</dt><dd>{lead.selectedSlot.label} · МСК</dd></div>
+                    <div><dt>Контакт</dt><dd>{lead.phone ?? lead.telegram ?? "не указан"}</dd></div>
+                    <div><dt>Почта</dt><dd>{lead.workEmail ?? "не указана"}</dd></div>
+                  </dl>
+                  {bookingReviewVisible && (
+                    <small className="review-confirmation">
+                      Подтверждаю запись на консультацию Botamin. Ссылка на встречу будет предоставлена календарём после подтверждения.
+                    </small>
+                  )}
+                </div>
+                <div className="review-actions">
+                  {bookingReviewVisible ? (
+                    <>
+                      <button className="nexus-button" disabled={bookingBusy} onClick={() => void confirmBooking()}>
+                        {bookingBusy ? "Создаём запись…" : "Подтвердить запись"}
+                      </button>
+                      <button className="text-action" disabled={bookingBusy} onClick={() => setBookingReviewVisible(false)}>Изменить данные</button>
+                    </>
+                  ) : (
+                    <button className="nexus-button" onClick={() => setBookingReviewVisible(true)}>Проверить запись</button>
+                  )}
+                </div>
               </div>
             )}
           </section>
@@ -504,10 +746,50 @@ export default function VoiceConsultant() {
                   <div>
                     Почта: <strong>{lead.workEmail ?? "не указана"}</strong>
                   </div>
-                  {lead.meetingUrl && <div>Ссылка: <a href={lead.meetingUrl} target="_blank" rel="noreferrer">Открыть встречу</a></div>}
+                  <div>Календарное приглашение: <strong>создано</strong></div>
+                  <div>Уведомление менеджеру: <strong>{lead.notificationStatus === "sent" ? "доставлено" : lead.notificationStatus === "failed" ? "ожидает повторной отправки" : lead.notificationStatus === "not_configured" ? "не настроено" : "отправляется"}</strong></div>
+                  {lead.meetingUrl && (
+                    <div className="meeting-link-actions">
+                      {meetingLabel}: <a href={lead.meetingUrl} target="_blank" rel="noreferrer">{lead.meetingUrl}</a>
+                      <a className="text-action" href={lead.meetingUrl} target="_blank" rel="noreferrer">
+                        {meetingLabel === "Google Meet" ? "Открыть Google Meet" : "Открыть видеовстречу"}
+                      </a>
+                      <button className="text-action" onClick={() => void copyMeetingUrl()}>
+                        {meetingUrlCopied ? "Скопировано" : "Копировать ссылку"}
+                      </button>
+                    </div>
+                  )}
               </div>
             </section>
           )}
+        {bookingModalVisible && lead?.bookingStatus === "confirmed" && lead.selectedSlot && (
+          <div className="booking-modal-backdrop" role="presentation">
+            <section className="booking-modal" role="dialog" aria-modal="true" aria-labelledby="booking-modal-title">
+              <div className="booking-sigil" aria-hidden>✓</div>
+              <p className="panel-header">КОНСУЛЬТАЦИЯ BOTAMIN</p>
+              <h2 id="booking-modal-title">Встреча подтверждена</h2>
+              <p>{lead.selectedSlot.label} · МСК</p>
+              <p>{lead.meetingUrl ? "Приглашение отправлено на вашу почту." : "Встреча создана, но ссылка на видеовстречу пока не получена. Проверьте приглашение на почте."}</p>
+              {lead.meetingUrl && (
+                <>
+                  <label className="meeting-url-field">
+                    {meetingLabel}
+                    <input readOnly value={lead.meetingUrl} aria-label="Ссылка на видеовстречу" />
+                  </label>
+                  <div className="modal-actions">
+                    <a className="nexus-button" href={lead.meetingUrl} target="_blank" rel="noreferrer">
+                      {meetingLabel === "Google Meet" ? "Открыть Google Meet" : "Открыть видеовстречу"}
+                    </a>
+                    <button className="text-action" onClick={() => void copyMeetingUrl()}>
+                      {meetingUrlCopied ? "Скопировано" : "Скопировать ссылку"}
+                    </button>
+                  </div>
+                </>
+              )}
+              <button className="text-action" onClick={() => setBookingModalVisible(false)}>Готово</button>
+            </section>
+          </div>
+        )}
       </div>
     </main>
   );

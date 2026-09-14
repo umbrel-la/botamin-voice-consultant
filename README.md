@@ -73,7 +73,7 @@ npm run build
 ## 5. Как развернуть на Vercel
 
 1. Импортируйте репозиторий в Vercel.
-2. В Project Settings → Environment Variables добавьте `OPENAI_API_KEY` и `OPENAI_REALTIME_MODEL=gpt-realtime-2.1`.
+2. В Project Settings → Environment Variables добавьте только server-side secrets из `.env.example`: `OPENAI_API_KEY`, `OPENAI_REALTIME_MODEL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `CALCOM_API_KEY`, `CALCOM_USERNAME`, `CALCOM_EVENT_TYPE_SLUG`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_MANAGER_CHAT_ID`, `CRON_SECRET`. Не используйте префикс `NEXT_PUBLIC_`.
 3. Разверните проект. Vercel автоматически использует `npm run build`.
 
 Через CLI:
@@ -83,6 +83,14 @@ npm install -g vercel
 vercel
 vercel env add OPENAI_API_KEY
 vercel env add OPENAI_REALTIME_MODEL
+vercel env add SUPABASE_URL
+vercel env add SUPABASE_SERVICE_ROLE_KEY
+vercel env add CALCOM_API_KEY
+vercel env add CALCOM_USERNAME
+vercel env add CALCOM_EVENT_TYPE_SLUG
+vercel env add TELEGRAM_BOT_TOKEN
+vercel env add TELEGRAM_MANAGER_CHAT_ID
+vercel env add CRON_SECRET
 vercel --prod
 ```
 

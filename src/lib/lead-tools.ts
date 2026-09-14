@@ -3,14 +3,36 @@ import "server-only";
 import { randomUUID } from "crypto";
 import { getCalcomSlots } from "@/lib/calcom";
 import { createCalcomBooking } from "@/lib/calcom";
-import { enqueueNotification, getLead, getSlots, getToolCall, saveSlots, saveToolCall, toPublicLead, updateLead } from "@/lib/lead-store";
+import { enqueueNotification, finishNotification, getLead, getSlots, getToolCall, saveSlots, saveToolCall, startNotificationAttempt, toPublicLead, updateLead } from "@/lib/lead-store";
 import { persistLead } from "@/lib/supabase-repository";
+import { persistNotificationJob } from "@/lib/supabase-repository";
+import { notifyTelegram } from "@/lib/telegram";
 import type { ContactType, Lead, ToolResult } from "@/lib/lead-types";
 
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
 function result(lead: Lead, success: boolean, message: string, extra: Omit<ToolResult, "success" | "message" | "lead"> = {}): ToolResult {
   return { success, message, lead: toPublicLead(lead), ...extra };
+}
+
+async function notifyManagerImmediately(leadId: string, sessionSecret: string) {
+  const lead = getLead(leadId, sessionSecret);
+  if (!lead) return null;
+
+  await persistNotificationJob(startNotificationAttempt(leadId));
+  try {
+    const delivery = await notifyTelegram(lead);
+    if (!delivery.configured) {
+      await persistNotificationJob(finishNotification(leadId, "not_configured", { lastError: null, messageId: null }));
+      return updateLead(leadId, sessionSecret, { notificationStatus: "not_configured" });
+    }
+    await persistNotificationJob(finishNotification(leadId, "sent", { lastError: null, messageId: delivery.messageId }));
+    return updateLead(leadId, sessionSecret, { notificationStatus: "sent" });
+  } catch (error) {
+    const lastError = error instanceof Error ? error.message : "Telegram notification failed";
+    await persistNotificationJob(finishNotification(leadId, "failed", { lastError, messageId: null }));
+    return updateLead(leadId, sessionSecret, { notificationStatus: "failed" });
+  }
 }
 
 export async function runLeadTool(
@@ -46,6 +68,17 @@ export async function runLeadTool(
     case "confirm_need_summary": {
       const confirmed = args.confirmed === true;
       output = result(updateLead(leadId, sessionSecret, { summaryConfirmed: confirmed })!, true, confirmed ? "Резюме подтверждено." : "Резюме требует уточнения.");
+      break;
+    }
+    case "save_conversation_context": {
+      const lastUserMessage = String(args.lastUserMessage ?? "").trim();
+      output = result(
+        updateLead(leadId, sessionSecret, {
+          lastUserMessage: lastUserMessage || lead.lastUserMessage,
+        })!,
+        true,
+        "Контекст разговора сохранён.",
+      );
       break;
     }
     case "get_available_slots": {
@@ -126,12 +159,13 @@ export async function runLeadTool(
         } else if (booking.conflict) {
           output = result(updateLead(leadId, sessionSecret, { bookingStatus: "conflict" })!, false, "Это время уже занято. Запросите два других варианта.");
         } else {
-          const updated = updateLead(leadId, sessionSecret, {
+          let updated = updateLead(leadId, sessionSecret, {
             bookingStatus: "confirmed", bookingId: booking.bookingId, meetingUrl: booking.meetingUrl,
-            notificationStatus: process.env.TELEGRAM_BOT_TOKEN ? "pending" : "not_configured",
+            notificationStatus: "pending",
             stages: ["booking_confirmed"],
           })!;
           enqueueNotification(leadId);
+          updated = (await notifyManagerImmediately(leadId, sessionSecret)) ?? updated;
           output = result(updated, true, "Встреча назначена.", { booking: { status: "confirmed", slot: updated.selectedSlot, meetingUrl: updated.meetingUrl } });
         }
       } catch {
@@ -140,10 +174,13 @@ export async function runLeadTool(
       break;
     }
     case "save_qualification": {
-      output = result(updateLead(leadId, sessionSecret, {
+      const updated = updateLead(leadId, sessionSecret, {
         leadsPerMonth: args.leadsPerMonth ? String(args.leadsPerMonth) : lead.leadsPerMonth,
         salesManagersCount: args.salesManagersCount ? String(args.salesManagersCount) : lead.salesManagersCount,
-      })!, true, "Квалификационные данные сохранены.");
+      })!;
+      output = result(updated, true, updated.leadsPerMonth && updated.salesManagersCount
+        ? "Квалификация завершена. Можно завершить разговор."
+        : "Часть квалификационных данных сохранена. Спросите только недостающий показатель.");
       break;
     }
     default:

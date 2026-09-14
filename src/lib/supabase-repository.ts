@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { Lead } from "@/lib/lead-types";
+import type { Lead, NotificationJob } from "@/lib/lead-types";
 
 function config() {
   const url = process.env.SUPABASE_URL;
@@ -60,6 +60,30 @@ export async function insertLead(lead: Lead) {
       notification_status: lead.notificationStatus,
       created_at: lead.createdAt,
       updated_at: lead.updatedAt,
+    }),
+  });
+  return response.ok;
+}
+
+export async function persistNotificationJob(job: NotificationJob) {
+  const client = config();
+  if (!client) return false;
+  const response = await fetch(`${client.url}/rest/v1/notification_jobs?on_conflict=lead_id`, {
+    method: "POST",
+    headers: {
+      apikey: client.key,
+      Authorization: `Bearer ${client.key}`,
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates,return=minimal",
+    },
+    body: JSON.stringify({
+      lead_id: job.leadId,
+      status: job.status,
+      attempts: job.attempts,
+      next_attempt_at: job.nextAttemptAt,
+      telegram_message_id: job.messageId,
+      last_error: job.lastError,
+      updated_at: job.updatedAt,
     }),
   });
   return response.ok;

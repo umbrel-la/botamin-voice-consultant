@@ -81,9 +81,44 @@ export async function getCalcomSlots(): Promise<
   return { configured: true, slots };
 }
 
+export function buildCalcomBookingPayload(lead: Lead) {
+  if (!lead.selectedSlot || !lead.name || !lead.workEmail) return null;
+  return {
+    start: new Date(lead.selectedSlot.startAtUtc).toISOString(),
+    eventTypeSlug: SALES_MANAGER_CONFIG.integrations.calcom.eventTypeSlug,
+    username: SALES_MANAGER_CONFIG.integrations.calcom.username,
+    attendee: {
+      name: lead.name,
+      email: lead.workEmail,
+      timeZone: zone,
+    },
+  };
+}
+
+function calcomDiagnostic(response: Response, payload: NonNullable<ReturnType<typeof buildCalcomBookingPayload>>, body: unknown) {
+  const error = typeof body === "object" && body
+    ? {
+        code: "code" in body ? String(body.code) : undefined,
+        message: "message" in body ? String(body.message) : "Cal.com returned an error response",
+      }
+    : { message: "Unparseable error response" };
+  console.error("Cal.com booking rejected", {
+    status: response.status,
+    requestId: response.headers.get("x-request-id") ?? response.headers.get("request-id"),
+    error,
+    request: {
+      start: payload.start,
+      eventTypeSlug: payload.eventTypeSlug,
+      username: payload.username,
+      attendee: { hasName: Boolean(payload.attendee.name), hasEmail: Boolean(payload.attendee.email), timeZone: payload.attendee.timeZone },
+    },
+  });
+}
+
 export async function createCalcomBooking(lead: Lead) {
   const apiKey = process.env.CALCOM_API_KEY;
-  if (!apiKey || !lead.selectedSlot || !lead.name || !lead.workEmail) {
+  const payload = buildCalcomBookingPayload(lead);
+  if (!apiKey || !payload) {
     return { configured: false as const };
   }
   const response = await fetch(`${CAL_API}/bookings`, {
@@ -92,24 +127,17 @@ export async function createCalcomBooking(lead: Lead) {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
       "cal-api-version": "2026-02-25",
-      "Idempotency-Key": `botamin-${lead.id}-${lead.selectedSlot.startAtUtc}`,
+      "Idempotency-Key": `botamin-${lead.id}-${payload.start}`,
     },
-    body: JSON.stringify({
-      start: lead.selectedSlot.startAtUtc,
-      eventTypeSlug: SALES_MANAGER_CONFIG.integrations.calcom.eventTypeSlug,
-      username: SALES_MANAGER_CONFIG.integrations.calcom.username,
-      attendee: {
-        name: lead.name,
-        email: lead.workEmail,
-        timeZone: zone,
-        language: "ru",
-        ...(lead.phone ? { phoneNumber: lead.phone } : {}),
-      },
-    }),
+    body: JSON.stringify(payload),
     cache: "no-store",
   });
-  if (response.status === 409 || response.status === 422) return { configured: true as const, conflict: true as const };
-  if (!response.ok) throw new Error("Не удалось создать бронирование.");
+  if (response.status === 409) return { configured: true as const, conflict: true as const };
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    calcomDiagnostic(response, payload, body);
+    throw new Error("Не удалось создать бронирование.");
+  }
   const data = (await response.json()) as { data?: { uid?: string; meetingUrl?: string; metadata?: { videoCallUrl?: string } } };
   return { configured: true as const, conflict: false as const, bookingId: data.data?.uid ?? null, meetingUrl: data.data?.meetingUrl ?? data.data?.metadata?.videoCallUrl ?? null };
 }

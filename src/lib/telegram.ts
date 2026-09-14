@@ -31,7 +31,17 @@ export async function notifyTelegram(lead: Lead) {
     body: JSON.stringify({ chat_id: chatId, text: telegramMessage(lead) }),
     cache: "no-store",
   });
-  if (!response.ok) throw new Error("Telegram notification failed");
-  const json = (await response.json()) as { result?: { message_id?: number } };
+  const json = (await response.json().catch(() => null)) as {
+    ok?: boolean; description?: string; result?: { message_id?: number };
+  } | null;
+  if (!response.ok || !json?.ok) {
+    const detail = json?.description ?? `HTTP ${response.status}`;
+    console.error("Telegram notification rejected", {
+      status: response.status,
+      message: detail,
+      chatId,
+    });
+    throw new Error(`Telegram API: ${detail}`);
+  }
   return { configured: true as const, messageId: String(json.result?.message_id ?? "") };
 }

@@ -13,6 +13,18 @@ export type BookingStatus =
   | "conflict"
   | "failed";
 
+export type NotificationJobStatus = "pending" | "sent" | "failed" | "not_configured";
+
+export type NotificationJob = {
+  leadId: string;
+  status: NotificationJobStatus;
+  attempts: number;
+  lastError: string | null;
+  messageId: string | null;
+  nextAttemptAt: string | null;
+  updatedAt: string;
+};
+
 export type Slot = {
   id: string;
   startAtUtc: string;
@@ -43,6 +55,8 @@ export type Lead = {
   bookingId: string | null;
   meetingUrl: string | null;
   notificationStatus: "pending" | "sent" | "failed" | "not_configured";
+  lastUserMessage: string | null;
+  conversationSummary: string;
   createdAt: string;
   updatedAt: string;
   stages: FunnelStage[];

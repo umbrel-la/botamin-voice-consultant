@@ -7,6 +7,7 @@ const ALLOWED_TOOLS = new Set([
   "save_company_activity", "save_discovery", "confirm_need_summary",
   "get_available_slots", "select_slot", "save_name", "save_contact",
   "save_work_email", "confirm_booking", "save_qualification",
+  "save_conversation_context",
 ]);
 
 function sessionFrom(request: NextRequest) {
